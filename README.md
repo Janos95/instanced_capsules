@@ -2,6 +2,8 @@
 
 This demo renders a grid of tapered capsules in the browser with WebGPU and Dear ImGui.
 
+Live page: [https://janosmeny.com/instanced_capsules/](https://janosmeny.com/instanced_capsules/)
+
 The renderer uses:
 
 - one reusable reference capsule mesh
