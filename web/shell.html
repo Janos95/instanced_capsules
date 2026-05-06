@@ -39,6 +39,7 @@
   <canvas id="canvas" class="emscripten" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
   <div id="status">WebGPU loading...</div>
   <script>
+    const assetVersion = "20260506-aa-frame";
     const canvas = document.getElementById("canvas");
     const statusEl = document.getElementById("status");
 
@@ -59,6 +60,12 @@
       canvas,
       print: (text) => console.log(text),
       printErr: (text) => console.error(text),
+      locateFile: (path, prefix) => {
+        if (path.endsWith(".wasm") || path.endsWith(".data")) {
+          return `${prefix}${path}?v=${assetVersion}`;
+        }
+        return `${prefix}${path}`;
+      },
       setStatus: (text) => { statusEl.textContent = text || ""; },
       onRuntimeInitialized: () => { statusEl.textContent = ""; }
     };

@@ -61,3 +61,10 @@ set_target_properties(index PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/web"
     SUFFIX ".html"
 )
+
+add_custom_command(TARGET index POST_BUILD
+    COMMAND ${CMAKE_COMMAND}
+        -DHTML=$<TARGET_FILE:index>
+        -DVERSION=20260506-aa-frame
+        -P ${CMAKE_SOURCE_DIR}/web/cache_bust.cmake
+)
