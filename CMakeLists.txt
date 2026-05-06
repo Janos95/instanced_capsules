@@ -9,6 +9,10 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+if (NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 include(FetchContent)
 
 FetchContent_Declare(
@@ -51,7 +55,6 @@ target_link_options(index PRIVATE
     -sUSE_GLFW=3
     -sALLOW_MEMORY_GROWTH=1
     -sNO_EXIT_RUNTIME=1
-    -sASSERTIONS=1
     -sDISABLE_EXCEPTION_CATCHING=1
     --shell-file=${CMAKE_SOURCE_DIR}/web/shell.html
     --preload-file=${imgui_SOURCE_DIR}/misc/fonts/Roboto-Medium.ttf@/fonts/Roboto-Medium.ttf
@@ -65,6 +68,6 @@ set_target_properties(index PROPERTIES
 add_custom_command(TARGET index POST_BUILD
     COMMAND ${CMAKE_COMMAND}
         -DHTML=$<TARGET_FILE:index>
-        -DVERSION=20260506-panel-cleanup
+        -DVERSION=20260506-perf
         -P ${CMAKE_SOURCE_DIR}/web/cache_bust.cmake
 )

@@ -267,9 +267,12 @@ static void connectRings(std::vector<uint32_t>& indices, int segments, int ringA
 }
 
 static void createSharedUnitCapsuleMesh(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices) {
-    constexpr int segments = 56;
-    constexpr int capStacks = 16;
-    constexpr int bodyStacks = 12;
+    // The shader provides smooth analytic normals, so the reference mesh can
+    // stay moderately coarse without looking faceted. This matters at N = 100:
+    // 10,000 instances multiply every extra ring/segment directly on the GPU.
+    constexpr int segments = 32;
+    constexpr int capStacks = 10;
+    constexpr int bodyStacks = 6;
 
     // This is the only capsule/tapered-capsule mesh built on the CPU.
     // It is a reusable reference parameter mesh. The WebGPU vertex shader maps
