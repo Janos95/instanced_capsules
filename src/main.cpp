@@ -62,6 +62,7 @@ struct CameraUniform {
 static constexpr float kPi = 3.14159265358979323846f;
 static constexpr float kSpacing = 2.55f;
 static constexpr float kSphereCenterDistance = 2.4f;
+static constexpr uint32_t kSceneSampleCount = 4;
 
 static GLFWwindow* gWindow = nullptr;
 static wgpu::Instance gInstance;
@@ -70,6 +71,7 @@ static wgpu::Device gDevice;
 static wgpu::Queue gQueue;
 static wgpu::Surface gSurface;
 static wgpu::TextureFormat gSurfaceFormat = wgpu::TextureFormat::BGRA8Unorm;
+static wgpu::TextureView gMsaaColorView;
 static wgpu::TextureView gDepthView;
 static wgpu::RenderPipeline gCapsulePipeline;
 static wgpu::RenderPipeline gGridPipeline;
@@ -91,6 +93,7 @@ static float gYaw = 38.0f * kPi / 180.0f;
 static float gPitch = 28.0f * kPi / 180.0f;
 static float gDistance = 27.0f;
 static float gHalfGridExtent = 0.0f;
+static float gRunningFrameMs = 0.0f;
 
 static std::vector<Vertex> gVertices;
 static std::vector<uint32_t> gIndices;
@@ -591,6 +594,7 @@ static wgpu::RenderPipeline createCapsulePipeline() {
     desc.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
     desc.primitive.frontFace = wgpu::FrontFace::CCW;
     desc.primitive.cullMode = wgpu::CullMode::Back;
+    desc.multisample.count = kSceneSampleCount;
     desc.depthStencil = &depth;
     return gDevice.CreateRenderPipeline(&desc);
 }
@@ -638,6 +642,7 @@ static wgpu::RenderPipeline createGridPipeline() {
     desc.primitive.topology = wgpu::PrimitiveTopology::LineList;
     desc.primitive.frontFace = wgpu::FrontFace::CCW;
     desc.primitive.cullMode = wgpu::CullMode::None;
+    desc.multisample.count = kSceneSampleCount;
     desc.depthStencil = &depth;
     return gDevice.CreateRenderPipeline(&desc);
 }
@@ -656,10 +661,18 @@ static void configureSurface(uint32_t width, uint32_t height) {
     config.presentMode = wgpu::PresentMode::Fifo;
     gSurface.Configure(&config);
 
+    wgpu::TextureDescriptor msaaColorDesc{};
+    msaaColorDesc.usage = wgpu::TextureUsage::RenderAttachment;
+    msaaColorDesc.size = {gWidth, gHeight, 1};
+    msaaColorDesc.format = gSurfaceFormat;
+    msaaColorDesc.sampleCount = kSceneSampleCount;
+    gMsaaColorView = gDevice.CreateTexture(&msaaColorDesc).CreateView();
+
     wgpu::TextureDescriptor depthDesc{};
     depthDesc.usage = wgpu::TextureUsage::RenderAttachment;
     depthDesc.size = {gWidth, gHeight, 1};
     depthDesc.format = wgpu::TextureFormat::Depth32Float;
+    depthDesc.sampleCount = kSceneSampleCount;
     gDepthView = gDevice.CreateTexture(&depthDesc).CreateView();
 }
 
@@ -707,12 +720,25 @@ static void updateCameraFromImGui() {
     }
 }
 
+static void updateRunningFrameTime() {
+    const float frameMs = ImGui::GetIO().DeltaTime * 1000.0f;
+    if (frameMs <= 0.0f) {
+        return;
+    }
+
+    if (gRunningFrameMs <= 0.0f) {
+        gRunningFrameMs = frameMs;
+    } else {
+        gRunningFrameMs += (frameMs - gRunningFrameMs) * 0.05f;
+    }
+}
+
 static void drawControls() {
     bool instanceChanged = false;
     bool gridChanged = false;
 
     ImGui::SetNextWindowPos(ImVec2(16.0f, 16.0f), ImGuiCond_FirstUseEver);
-    ImGui::SetNextWindowSize(ImVec2(360.0f, 210.0f), ImGuiCond_FirstUseEver);
+    ImGui::SetNextWindowSize(ImVec2(380.0f, 250.0f), ImGuiCond_FirstUseEver);
     ImGui::Begin("Capsule controls");
 
     int requestedGridCount = gControls.gridCount;
@@ -753,6 +779,8 @@ static void drawControls() {
     ImGui::Text("h %.2f", kSphereCenterDistance);
 
     ImGui::Text("capsules: one WebGPU DrawIndexed(%u, %u)", gIndexCount, gInstanceCount);
+    ImGui::Text("AA: %ux MSAA", kSceneSampleCount);
+    ImGui::Text("running avg frame: %.2f ms (%.1f fps)", gRunningFrameMs, gRunningFrameMs > 0.0f ? 1000.0f / gRunningFrameMs : 0.0f);
     ImGui::End();
 
     if (instanceChanged || gridChanged) {
@@ -788,6 +816,7 @@ static void frame() {
     ImGui::NewFrame();
 
     updateCameraFromImGui();
+    updateRunningFrameTime();
     drawControls();
     ImGui::Render();
     updateCameraUniform();
@@ -800,25 +829,26 @@ static void frame() {
 
     wgpu::TextureView backbuffer = surfaceTexture.texture.CreateView();
 
-    wgpu::RenderPassColorAttachment colorAttachment{};
-    colorAttachment.view = backbuffer;
-    colorAttachment.loadOp = wgpu::LoadOp::Clear;
-    colorAttachment.storeOp = wgpu::StoreOp::Store;
-    colorAttachment.clearValue = {0.08, 0.085, 0.095, 1.0};
+    wgpu::RenderPassColorAttachment sceneColorAttachment{};
+    sceneColorAttachment.view = gMsaaColorView;
+    sceneColorAttachment.resolveTarget = backbuffer;
+    sceneColorAttachment.loadOp = wgpu::LoadOp::Clear;
+    sceneColorAttachment.storeOp = wgpu::StoreOp::Discard;
+    sceneColorAttachment.clearValue = {0.08, 0.085, 0.095, 1.0};
 
     wgpu::RenderPassDepthStencilAttachment depthAttachment{};
     depthAttachment.view = gDepthView;
     depthAttachment.depthLoadOp = wgpu::LoadOp::Clear;
-    depthAttachment.depthStoreOp = wgpu::StoreOp::Store;
+    depthAttachment.depthStoreOp = wgpu::StoreOp::Discard;
     depthAttachment.depthClearValue = 1.0f;
 
-    wgpu::RenderPassDescriptor passDesc{};
-    passDesc.colorAttachmentCount = 1;
-    passDesc.colorAttachments = &colorAttachment;
-    passDesc.depthStencilAttachment = &depthAttachment;
+    wgpu::RenderPassDescriptor scenePassDesc{};
+    scenePassDesc.colorAttachmentCount = 1;
+    scenePassDesc.colorAttachments = &sceneColorAttachment;
+    scenePassDesc.depthStencilAttachment = &depthAttachment;
 
     wgpu::CommandEncoder encoder = gDevice.CreateCommandEncoder();
-    wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&passDesc);
+    wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&scenePassDesc);
 
     pass.SetPipeline(gGridPipeline);
     pass.SetBindGroup(0, gCameraBindGroup);
@@ -832,8 +862,20 @@ static void frame() {
     pass.SetIndexBuffer(gMeshIndexBuffer, wgpu::IndexFormat::Uint32);
     pass.DrawIndexed(gIndexCount, gInstanceCount);
 
-    ImGui_ImplWGPU_RenderDrawData(ImGui::GetDrawData(), pass.Get());
     pass.End();
+
+    wgpu::RenderPassColorAttachment uiColorAttachment{};
+    uiColorAttachment.view = backbuffer;
+    uiColorAttachment.loadOp = wgpu::LoadOp::Load;
+    uiColorAttachment.storeOp = wgpu::StoreOp::Store;
+
+    wgpu::RenderPassDescriptor uiPassDesc{};
+    uiPassDesc.colorAttachmentCount = 1;
+    uiPassDesc.colorAttachments = &uiColorAttachment;
+
+    wgpu::RenderPassEncoder uiPass = encoder.BeginRenderPass(&uiPassDesc);
+    ImGui_ImplWGPU_RenderDrawData(ImGui::GetDrawData(), uiPass.Get());
+    uiPass.End();
 
     wgpu::CommandBuffer commands = encoder.Finish();
     gQueue.Submit(1, &commands);
@@ -865,7 +907,7 @@ static void setupImGui() {
     initInfo.Device = gDevice.Get();
     initInfo.NumFramesInFlight = 3;
     initInfo.RenderTargetFormat = static_cast<WGPUTextureFormat>(gSurfaceFormat);
-    initInfo.DepthStencilFormat = WGPUTextureFormat_Depth32Float;
+    initInfo.DepthStencilFormat = WGPUTextureFormat_Undefined;
     ImGui_ImplWGPU_Init(&initInfo);
 }
 

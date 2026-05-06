@@ -9,6 +9,7 @@ The renderer uses:
 - one reusable reference capsule mesh
 - one instance buffer containing `position`, sphere-center distance `height`/`h`, `r1`, `r2`, and `color`
 - one indexed instanced WebGPU draw call for all capsules:
+- 4x MSAA for the scene pass, resolved before the ImGui overlay pass
 
 ```cpp
 pass.DrawIndexed(indexCount, instanceCount);
@@ -36,5 +37,5 @@ Open [http://localhost:8000](http://localhost:8000).
 
 - Drag left mouse button: orbit camera
 - Mouse wheel: zoom
-- ImGui panel: edit grid `N`, min/max `r1`, and min/max `r2`
+- ImGui panel: edit grid `N`, min/max `r1`, min/max `r2`, and view running average frame time
 - `R`: reset camera
