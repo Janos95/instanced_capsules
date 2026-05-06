@@ -806,7 +806,6 @@ static void drawControls() {
     ImGui::SameLine();
     ImGui::Text("h %.2f", kSphereCenterDistance);
 
-    ImGui::Text("capsules: one WebGPU DrawIndexed(%u, %u)", gIndexCount, gInstanceCount);
     ImGui::Text("AA: %ux MSAA", kSceneSampleCount);
     ImGui::Text("running avg frame: %.2f ms (%.1f fps)", gRunningFrameMs, gRunningFrameMs > 0.0f ? 1000.0f / gRunningFrameMs : 0.0f);
     ImGui::End();
