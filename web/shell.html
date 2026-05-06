@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>WebGPU Instanced Tapered Capsules</title>
+  <style>
+    html, body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+      overflow: hidden;
+      background: #14161a;
+      color: #d8dde7;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    canvas.emscripten {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      border: 0;
+      outline: none;
+      background: #14161a;
+    }
+
+    #status {
+      position: fixed;
+      left: 14px;
+      bottom: 10px;
+      font-size: 12px;
+      color: rgba(216, 221, 231, 0.72);
+      pointer-events: none;
+      user-select: none;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="canvas" class="emscripten" oncontextmenu="event.preventDefault()" tabindex="-1"></canvas>
+  <div id="status">WebGPU loading...</div>
+  <script>
+    const canvas = document.getElementById("canvas");
+    const statusEl = document.getElementById("status");
+
+    function resizeCanvas() {
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      const width = Math.max(1, Math.floor(window.innerWidth * dpr));
+      const height = Math.max(1, Math.floor(window.innerHeight * dpr));
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+      }
+    }
+
+    window.addEventListener("resize", resizeCanvas);
+    resizeCanvas();
+
+    var Module = {
+      canvas,
+      print: (text) => console.log(text),
+      printErr: (text) => console.error(text),
+      setStatus: (text) => { statusEl.textContent = text || ""; },
+      onRuntimeInitialized: () => { statusEl.textContent = ""; }
+    };
+  </script>
+  {{{ SCRIPT }}}
+</body>
+</html>

@@ -1,0 +1,8 @@
+build*/
+*.o
+*.a
+*.wasm
+*.js
+*.data
+imgui.ini
+.DS_Store
