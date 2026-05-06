@@ -92,6 +92,7 @@ static DemoControls gControls;
 static float gYaw = 38.0f * kPi / 180.0f;
 static float gPitch = 28.0f * kPi / 180.0f;
 static float gDistance = 27.0f;
+static Vec3 gCameraTarget{0.0f, kSphereCenterDistance * 0.55f, 0.0f};
 static float gHalfGridExtent = 0.0f;
 static float gRunningFrameMs = 0.0f;
 
@@ -114,6 +115,17 @@ static Vec3 operator+(Vec3 a, Vec3 b) {
 
 static Vec3 operator-(Vec3 a, Vec3 b) {
     return {a.x - b.x, a.y - b.y, a.z - b.z};
+}
+
+static Vec3 operator*(Vec3 v, float s) {
+    return {v.x * s, v.y * s, v.z * s};
+}
+
+static Vec3& operator+=(Vec3& a, Vec3 b) {
+    a.x += b.x;
+    a.y += b.y;
+    a.z += b.z;
+    return a;
 }
 
 static float dot(Vec3 a, Vec3 b) {
@@ -677,15 +689,14 @@ static void configureSurface(uint32_t width, uint32_t height) {
 }
 
 static void updateCameraUniform() {
-    const Vec3 target{0.0f, kSphereCenterDistance * 0.55f, 0.0f};
     const Vec3 eye{
-        target.x + gDistance * std::cos(gPitch) * std::sin(gYaw),
-        target.y + gDistance * std::sin(gPitch),
-        target.z + gDistance * std::cos(gPitch) * std::cos(gYaw),
+        gCameraTarget.x + gDistance * std::cos(gPitch) * std::sin(gYaw),
+        gCameraTarget.y + gDistance * std::sin(gPitch),
+        gCameraTarget.z + gDistance * std::cos(gPitch) * std::cos(gYaw),
     };
 
     const float aspect = static_cast<float>(gWidth) / static_cast<float>(std::max(gHeight, 1u));
-    const Mat4 view = lookAt(eye, target, {0.0f, 1.0f, 0.0f});
+    const Mat4 view = lookAt(eye, gCameraTarget, {0.0f, 1.0f, 0.0f});
     const Mat4 proj = perspectiveWebGPU(radians(45.0f), aspect, 0.05f, 1000.0f);
     const Mat4 viewProj = multiply(proj, view);
 
@@ -702,6 +713,7 @@ static void resetCamera() {
     gYaw = radians(38.0f);
     gPitch = radians(28.0f);
     gDistance = std::max(27.0f, gHalfGridExtent * 2.2f);
+    gCameraTarget = {0.0f, kSphereCenterDistance * 0.55f, 0.0f};
 }
 
 static void updateCameraFromImGui() {
@@ -712,6 +724,22 @@ static void updateCameraFromImGui() {
             gYaw -= delta.x * 0.006f;
             gPitch += delta.y * 0.006f;
             gPitch = std::clamp(gPitch, radians(8.0f), radians(78.0f));
+        }
+        if (ImGui::IsMouseDragging(ImGuiMouseButton_Right)) {
+            const ImVec2 delta = io.MouseDelta;
+            const Vec3 eye{
+                gCameraTarget.x + gDistance * std::cos(gPitch) * std::sin(gYaw),
+                gCameraTarget.y + gDistance * std::sin(gPitch),
+                gCameraTarget.z + gDistance * std::cos(gPitch) * std::cos(gYaw),
+            };
+            const Vec3 viewDir = normalize(gCameraTarget - eye);
+            const Vec3 right = normalize(cross(viewDir, {0.0f, 1.0f, 0.0f}));
+            const Vec3 up = normalize(cross(right, viewDir));
+
+            // Move the look-at target so the world follows the right-drag motion.
+            const float displayHeight = std::max(io.DisplaySize.y, 1.0f);
+            const float worldPerPixel = 2.0f * gDistance * std::tan(radians(45.0f) * 0.5f) / displayHeight;
+            gCameraTarget += right * (-delta.x * worldPerPixel) + up * (delta.y * worldPerPixel);
         }
         if (io.MouseWheel != 0.0f) {
             gDistance *= std::pow(0.88f, io.MouseWheel);

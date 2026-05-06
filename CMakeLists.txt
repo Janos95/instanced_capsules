@@ -65,6 +65,6 @@ set_target_properties(index PROPERTIES
 add_custom_command(TARGET index POST_BUILD
     COMMAND ${CMAKE_COMMAND}
         -DHTML=$<TARGET_FILE:index>
-        -DVERSION=20260506-aa-frame
+        -DVERSION=20260506-pan
         -P ${CMAKE_SOURCE_DIR}/web/cache_bust.cmake
 )

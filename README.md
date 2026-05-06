@@ -36,6 +36,7 @@ Open [http://localhost:8000](http://localhost:8000).
 ## Controls
 
 - Drag left mouse button: orbit camera
+- Drag right mouse button: pan camera
 - Mouse wheel: zoom
 - ImGui panel: edit grid `N`, min/max `r1`, min/max `r2`, and view running average frame time
 - `R`: reset camera
