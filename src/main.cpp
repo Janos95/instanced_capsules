@@ -8,13 +8,12 @@
 #include <vector>
 
 #include <emscripten.h>
-#include <GLFW/glfw3.h>
-#include <webgpu/webgpu.h>
-#include <webgpu/webgpu_cpp.h>
+#include <emscripten/html5.h>
+#include <GLES3/gl3.h>
+#include <SDL2/SDL.h>
 
 #include "imgui.h"
-#include "imgui_impl_glfw.h"
-#include "imgui_impl_wgpu.h"
+#include "imgui_impl_opengl3.h"
 
 struct Vec3 {
     float x;
@@ -54,47 +53,40 @@ struct DemoControls {
     RadiusControls radii;
 };
 
-struct CameraUniform {
-    float viewProj[16];
-    float cameraPos[4];
-};
-
 static constexpr float kPi = 3.14159265358979323846f;
 static constexpr float kSpacing = 2.55f;
 static constexpr float kSphereCenterDistance = 2.4f;
-static constexpr uint32_t kSceneSampleCount = 4;
 
-static GLFWwindow* gWindow = nullptr;
-static wgpu::Instance gInstance;
-static wgpu::Adapter gAdapter;
-static wgpu::Device gDevice;
-static wgpu::Queue gQueue;
-static wgpu::Surface gSurface;
-static wgpu::TextureFormat gSurfaceFormat = wgpu::TextureFormat::BGRA8Unorm;
-static wgpu::TextureView gMsaaColorView;
-static wgpu::TextureView gDepthView;
-static wgpu::RenderPipeline gCapsulePipeline;
-static wgpu::RenderPipeline gGridPipeline;
-static wgpu::BindGroupLayout gCameraBindGroupLayout;
-static wgpu::BindGroup gCameraBindGroup;
-static wgpu::Buffer gCameraBuffer;
-static wgpu::Buffer gMeshVertexBuffer;
-static wgpu::Buffer gMeshIndexBuffer;
-static wgpu::Buffer gInstanceBuffer;
-static wgpu::Buffer gGridBuffer;
+static SDL_Window* gWindow = nullptr;
+static SDL_GLContext gGlContext = nullptr;
+static GLuint gCapsuleProgram = 0;
+static GLuint gGridProgram = 0;
+static GLuint gCapsuleVao = 0;
+static GLuint gCapsuleVertexBuffer = 0;
+static GLuint gCapsuleIndexBuffer = 0;
+static GLuint gInstanceBuffer = 0;
+static GLuint gGridVao = 0;
+static GLuint gGridBuffer = 0;
+static GLint gCapsuleViewProjLocation = -1;
+static GLint gCapsuleCameraPosLocation = -1;
+static GLint gGridViewProjLocation = -1;
 static uint32_t gWidth = 1280;
 static uint32_t gHeight = 900;
 static uint32_t gIndexCount = 0;
 static uint32_t gInstanceCount = 0;
 static uint32_t gGridVertexCount = 0;
+static GLint gReportedSamples = 0;
 
 static DemoControls gControls;
 static float gYaw = 38.0f * kPi / 180.0f;
 static float gPitch = 28.0f * kPi / 180.0f;
 static float gDistance = 27.0f;
 static Vec3 gCameraTarget{0.0f, kSphereCenterDistance * 0.55f, 0.0f};
+static Vec3 gCameraPos{0.0f, 0.0f, 0.0f};
+static Mat4 gViewProj;
 static float gHalfGridExtent = 0.0f;
 static float gRunningFrameMs = 0.0f;
+static bool gResetPressed = false;
 
 static std::vector<Vertex> gVertices;
 static std::vector<uint32_t> gIndices;
@@ -171,14 +163,14 @@ static Mat4 multiply(const Mat4& a, const Mat4& b) {
     return r;
 }
 
-static Mat4 perspectiveWebGPU(float fovyRadians, float aspect, float nearPlane, float farPlane) {
+static Mat4 perspectiveOpenGL(float fovyRadians, float aspect, float nearPlane, float farPlane) {
     Mat4 r{};
     const float f = 1.0f / std::tan(fovyRadians * 0.5f);
     r.m[0] = f / aspect;
     r.m[5] = f;
-    r.m[10] = farPlane / (nearPlane - farPlane);
+    r.m[10] = (farPlane + nearPlane) / (nearPlane - farPlane);
     r.m[11] = -1.0f;
-    r.m[14] = (farPlane * nearPlane) / (nearPlane - farPlane);
+    r.m[14] = (2.0f * farPlane * nearPlane) / (nearPlane - farPlane);
     return r;
 }
 
@@ -201,30 +193,6 @@ static Mat4 lookAt(Vec3 eye, Vec3 center, Vec3 up) {
     r.m[13] = -dot(u, eye);
     r.m[14] = dot(f, eye);
     return r;
-}
-
-static wgpu::BufferUsage bufferUsage(std::initializer_list<wgpu::BufferUsage> values) {
-    uint64_t bits = 0;
-    for (wgpu::BufferUsage value : values) {
-        bits |= static_cast<uint64_t>(value);
-    }
-    return static_cast<wgpu::BufferUsage>(bits);
-}
-
-static wgpu::TextureUsage textureUsage(std::initializer_list<wgpu::TextureUsage> values) {
-    uint64_t bits = 0;
-    for (wgpu::TextureUsage value : values) {
-        bits |= static_cast<uint64_t>(value);
-    }
-    return static_cast<wgpu::TextureUsage>(bits);
-}
-
-static wgpu::ShaderStage shaderStage(std::initializer_list<wgpu::ShaderStage> values) {
-    uint64_t bits = 0;
-    for (wgpu::ShaderStage value : values) {
-        bits |= static_cast<uint64_t>(value);
-    }
-    return static_cast<wgpu::ShaderStage>(bits);
 }
 
 static void addRing(std::vector<Vertex>& vertices,
@@ -267,17 +235,13 @@ static void connectRings(std::vector<uint32_t>& indices, int segments, int ringA
 }
 
 static void createSharedUnitCapsuleMesh(std::vector<Vertex>& vertices, std::vector<uint32_t>& indices) {
-    // The shader provides smooth analytic normals, so the reference mesh can
-    // stay moderately coarse without looking faceted. This matters at N = 100:
-    // 10,000 instances multiply every extra ring/segment directly on the GPU.
+    // This is the only capsule mesh built on the CPU. It is just a reusable
+    // parameter mesh; the WebGL2 vertex shader maps each ring to the per-instance
+    // convex hull defined by h, r1, and r2.
     constexpr int segments = 32;
     constexpr int capStacks = 10;
     constexpr int bodyStacks = 6;
 
-    // This is the only capsule/tapered-capsule mesh built on the CPU.
-    // It is a reusable reference parameter mesh. The WebGPU vertex shader maps
-    // its logical bottom/body/top regions to the convex hull of two spheres using
-    // each instance's h, r1, and r2.
     auto pushRing = [&](float y, float radius, Vec3 normal, float vAlong, float region, float bodyT) {
         addRing(vertices, segments, y, radius, normal, vAlong, region, bodyT);
     };
@@ -364,331 +328,315 @@ static void rebuildGridLines() {
     gGridVertexCount = static_cast<uint32_t>(gGridLines.size());
 }
 
-static wgpu::Buffer createBuffer(const void* data, size_t size, wgpu::BufferUsage usage) {
-    wgpu::BufferDescriptor desc{};
-    desc.size = std::max<size_t>(size, 4);
-    desc.usage = usage;
-    desc.mappedAtCreation = data != nullptr && size > 0;
-    wgpu::Buffer buffer = gDevice.CreateBuffer(&desc);
-    if (data && size > 0) {
-        std::memcpy(buffer.GetMappedRange(0, size), data, size);
-        buffer.Unmap();
+static const char* kCapsuleVertexShader = R"GLSL(#version 300 es
+precision highp float;
+
+layout(location = 0) in vec3 aPosition;
+layout(location = 1) in vec3 aNormal;
+layout(location = 2) in float aVAlong;
+layout(location = 3) in float aRegion;
+layout(location = 4) in float aBodyT;
+layout(location = 5) in vec3 aInstancePosition;
+layout(location = 6) in float aHeight;
+layout(location = 7) in float aR1;
+layout(location = 8) in float aR2;
+layout(location = 9) in vec3 aColor;
+
+uniform mat4 uViewProj;
+
+out vec3 vWorldPos;
+out vec3 vNormal;
+out vec3 vColor;
+
+void main() {
+    float h = max(aHeight, abs(aR2 - aR1) + 0.001);
+    float s = clamp((aR2 - aR1) / h, -0.98, 0.98);
+    float q = sqrt(max(1.0 - s * s, 0.0001));
+    float tangentAngle = -asin(s);
+
+    float radialLen = length(aPosition.xz);
+    vec2 radialDir = radialLen > 0.00001 ? aPosition.xz / radialLen : vec2(1.0, 0.0);
+
+    float localRadius;
+    float localY;
+    vec3 n;
+
+    if (aRegion < 0.5) {
+        float capT = clamp(aPosition.y / 0.2, 0.0, 1.0);
+        float theta = -1.57079632679 + (tangentAngle + 1.57079632679) * capT;
+        localRadius = aR1 * cos(theta);
+        localY = aR1 * sin(theta);
+        n = normalize(vec3(radialDir.x * cos(theta), sin(theta), radialDir.y * cos(theta)));
+    } else if (aRegion > 1.5) {
+        float capT = clamp((aPosition.y - 0.8) / 0.2, 0.0, 1.0);
+        float theta = tangentAngle + (1.57079632679 - tangentAngle) * capT;
+        localRadius = aR2 * cos(theta);
+        localY = h + aR2 * sin(theta);
+        n = normalize(vec3(radialDir.x * cos(theta), sin(theta), radialDir.y * cos(theta)));
+    } else {
+        localRadius = aR1 * q + (aR2 * q - aR1 * q) * aBodyT;
+        localY = (-aR1 * s) + ((h - aR2 * s) - (-aR1 * s)) * aBodyT;
+        n = normalize(vec3(radialDir.x * q, -s, radialDir.y * q));
     }
-    return buffer;
+
+    vec3 world = vec3(
+        radialDir.x * localRadius + aInstancePosition.x,
+        localY + aR1 + aInstancePosition.y,
+        radialDir.y * localRadius + aInstancePosition.z
+    );
+
+    vWorldPos = world;
+    vNormal = n;
+    vColor = aColor;
+    gl_Position = uViewProj * vec4(world, 1.0);
+}
+)GLSL";
+
+static const char* kCapsuleFragmentShader = R"GLSL(#version 300 es
+precision highp float;
+
+uniform vec3 uCameraPos;
+
+in vec3 vWorldPos;
+in vec3 vNormal;
+in vec3 vColor;
+
+out vec4 fragColor;
+
+void main() {
+    vec3 N = normalize(vNormal);
+    vec3 V = normalize(uCameraPos - vWorldPos);
+    vec3 keyDir = normalize(vec3(-0.45, 0.82, 0.35));
+    vec3 fillDir = normalize(vec3(0.75, 0.38, -0.55));
+    vec3 topDir = normalize(vec3(0.10, 1.00, 0.15));
+
+    float key = max(dot(N, keyDir), 0.0);
+    float fill = max(dot(N, fillDir), 0.0);
+    float top = max(dot(N, topDir), 0.0);
+    float sky = clamp(N.y * 0.5 + 0.5, 0.0, 1.0);
+    float rim = pow(1.0 - max(dot(N, V), 0.0), 2.0);
+
+    vec3 ambient = mix(vec3(0.13, 0.14, 0.17), vec3(0.24, 0.25, 0.28), sky);
+    vec3 diffuse =
+        ambient +
+        key * vec3(0.52, 0.50, 0.46) +
+        fill * vec3(0.13, 0.17, 0.24) +
+        top * vec3(0.08, 0.08, 0.07);
+
+    vec3 H = normalize(keyDir + V);
+    float spec = pow(max(dot(N, H), 0.0), 64.0) * 0.07;
+    vec3 color = vColor * diffuse + vec3(spec) + rim * vec3(0.035, 0.045, 0.060);
+    fragColor = vec4(color, 1.0);
+}
+)GLSL";
+
+static const char* kGridVertexShader = R"GLSL(#version 300 es
+precision highp float;
+
+layout(location = 0) in vec3 aPosition;
+
+uniform mat4 uViewProj;
+
+void main() {
+    gl_Position = uViewProj * vec4(aPosition, 1.0);
+}
+)GLSL";
+
+static const char* kGridFragmentShader = R"GLSL(#version 300 es
+precision highp float;
+
+out vec4 fragColor;
+
+void main() {
+    fragColor = vec4(0.26, 0.28, 0.30, 1.0);
+}
+)GLSL";
+
+static GLuint compileShader(GLenum type, const char* source, const char* label) {
+    GLuint shader = glCreateShader(type);
+    glShaderSource(shader, 1, &source, nullptr);
+    glCompileShader(shader);
+
+    GLint ok = GL_FALSE;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        GLint logLength = 0;
+        glGetShaderiv(shader, GL_INFO_LOG_LENGTH, &logLength);
+        std::vector<char> log(static_cast<size_t>(std::max(logLength, 1)));
+        glGetShaderInfoLog(shader, logLength, nullptr, log.data());
+        std::printf("%s shader compile failed: %s\n", label, log.data());
+        glDeleteShader(shader);
+        return 0;
+    }
+
+    return shader;
+}
+
+static GLuint createProgram(const char* vertexSource, const char* fragmentSource, const char* label) {
+    GLuint vertexShader = compileShader(GL_VERTEX_SHADER, vertexSource, label);
+    GLuint fragmentShader = compileShader(GL_FRAGMENT_SHADER, fragmentSource, label);
+    if (!vertexShader || !fragmentShader) {
+        glDeleteShader(vertexShader);
+        glDeleteShader(fragmentShader);
+        return 0;
+    }
+
+    GLuint program = glCreateProgram();
+    glAttachShader(program, vertexShader);
+    glAttachShader(program, fragmentShader);
+    glLinkProgram(program);
+    glDeleteShader(vertexShader);
+    glDeleteShader(fragmentShader);
+
+    GLint ok = GL_FALSE;
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        GLint logLength = 0;
+        glGetProgramiv(program, GL_INFO_LOG_LENGTH, &logLength);
+        std::vector<char> log(static_cast<size_t>(std::max(logLength, 1)));
+        glGetProgramInfoLog(program, logLength, nullptr, log.data());
+        std::printf("%s program link failed: %s\n", label, log.data());
+        glDeleteProgram(program);
+        return 0;
+    }
+
+    return program;
 }
 
 static void uploadDynamicSceneBuffers() {
-    gInstanceBuffer = createBuffer(
+    glBindBuffer(GL_ARRAY_BUFFER, gInstanceBuffer);
+    glBufferData(
+        GL_ARRAY_BUFFER,
+        static_cast<GLsizeiptr>(gInstances.size() * sizeof(Instance)),
         gInstances.data(),
-        gInstances.size() * sizeof(Instance),
-        bufferUsage({wgpu::BufferUsage::Vertex, wgpu::BufferUsage::CopyDst}));
-    gGridBuffer = createBuffer(
+        GL_DYNAMIC_DRAW);
+
+    glBindBuffer(GL_ARRAY_BUFFER, gGridBuffer);
+    glBufferData(
+        GL_ARRAY_BUFFER,
+        static_cast<GLsizeiptr>(gGridLines.size() * sizeof(Vec3)),
         gGridLines.data(),
-        gGridLines.size() * sizeof(Vec3),
-        bufferUsage({wgpu::BufferUsage::Vertex, wgpu::BufferUsage::CopyDst}));
+        GL_DYNAMIC_DRAW);
 }
 
-static const char* kCapsuleWGSL = R"WGSL(
-struct Camera {
-    viewProj: mat4x4<f32>,
-    cameraPos: vec4<f32>,
-};
+static int imguiMouseButtonFromDom(int button) {
+    if (button == 2) {
+        return ImGuiMouseButton_Right;
+    }
+    if (button == 1) {
+        return ImGuiMouseButton_Middle;
+    }
+    return ImGuiMouseButton_Left;
+}
 
-@group(0) @binding(0) var<uniform> camera: Camera;
+static EM_BOOL mouseMoveCallback(int, const EmscriptenMouseEvent* event, void*) {
+    ImGui::GetIO().AddMousePosEvent(static_cast<float>(event->clientX), static_cast<float>(event->clientY));
+    return EM_TRUE;
+}
 
-struct VertexInput {
-    @location(0) position: vec3<f32>,
-    @location(1) normal: vec3<f32>,
-    @location(2) vAlong: f32,
-    @location(3) region: f32,
-    @location(4) bodyT: f32,
-    @location(5) instancePosition: vec3<f32>,
-    @location(6) height: f32,
-    @location(7) r1: f32,
-    @location(8) r2: f32,
-    @location(9) color: vec3<f32>,
-};
+static EM_BOOL mouseButtonCallback(int eventType, const EmscriptenMouseEvent* event, void*) {
+    ImGuiIO& io = ImGui::GetIO();
+    io.AddMousePosEvent(static_cast<float>(event->clientX), static_cast<float>(event->clientY));
+    io.AddMouseButtonEvent(imguiMouseButtonFromDom(event->button), eventType == EMSCRIPTEN_EVENT_MOUSEDOWN);
+    return EM_TRUE;
+}
 
-struct VertexOutput {
-    @builtin(position) clipPosition: vec4<f32>,
-    @location(0) worldPos: vec3<f32>,
-    @location(1) normal: vec3<f32>,
-    @location(2) color: vec3<f32>,
-};
+static EM_BOOL wheelCallback(int, const EmscriptenWheelEvent* event, void*) {
+    constexpr double kWheelScale = 100.0;
+    ImGui::GetIO().AddMouseWheelEvent(
+        static_cast<float>(-event->deltaX / kWheelScale),
+        static_cast<float>(-event->deltaY / kWheelScale));
+    return EM_TRUE;
+}
 
-@vertex
-fn capsule_vs(input: VertexInput) -> VertexOutput {
-    let h = max(input.height, abs(input.r2 - input.r1) + 0.001);
-    let s = clamp((input.r2 - input.r1) / h, -0.98, 0.98);
-    let q = sqrt(max(1.0 - s * s, 0.0001));
-    let tangentAngle = -asin(s);
-
-    let radialLen = length(input.position.xz);
-    let radialDir = select(vec2<f32>(1.0, 0.0), input.position.xz / radialLen, radialLen > 0.00001);
-
-    var localRadius: f32;
-    var localY: f32;
-    var n: vec3<f32>;
-
-    if (input.region < 0.5) {
-        let capT = clamp(input.position.y / 0.2, 0.0, 1.0);
-        let theta = -1.57079632679 + (tangentAngle + 1.57079632679) * capT;
-        localRadius = input.r1 * cos(theta);
-        localY = input.r1 * sin(theta);
-        n = normalize(vec3<f32>(radialDir.x * cos(theta), sin(theta), radialDir.y * cos(theta)));
-    } else if (input.region > 1.5) {
-        let capT = clamp((input.position.y - 0.8) / 0.2, 0.0, 1.0);
-        let theta = tangentAngle + (1.57079632679 - tangentAngle) * capT;
-        localRadius = input.r2 * cos(theta);
-        localY = h + input.r2 * sin(theta);
-        n = normalize(vec3<f32>(radialDir.x * cos(theta), sin(theta), radialDir.y * cos(theta)));
-    } else {
-        localRadius = input.r1 * q + (input.r2 * q - input.r1 * q) * input.bodyT;
-        localY = (-input.r1 * s) + ((h - input.r2 * s) - (-input.r1 * s)) * input.bodyT;
-        n = normalize(vec3<f32>(radialDir.x * q, -s, radialDir.y * q));
+static EM_BOOL touchCallback(int eventType, const EmscriptenTouchEvent* event, void*) {
+    ImGuiIO& io = ImGui::GetIO();
+    if (event->numTouches > 0) {
+        const EmscriptenTouchPoint& touch = event->touches[0];
+        io.AddMousePosEvent(static_cast<float>(touch.clientX), static_cast<float>(touch.clientY));
     }
 
-    let world = vec3<f32>(
-        radialDir.x * localRadius + input.instancePosition.x,
-        localY + input.r1 + input.instancePosition.y,
-        radialDir.y * localRadius + input.instancePosition.z
-    );
-
-    var output: VertexOutput;
-    output.clipPosition = camera.viewProj * vec4<f32>(world, 1.0);
-    output.worldPos = world;
-    output.normal = n;
-    output.color = input.color;
-    return output;
+    if (eventType == EMSCRIPTEN_EVENT_TOUCHSTART) {
+        io.AddMouseButtonEvent(ImGuiMouseButton_Left, true);
+    } else if (eventType == EMSCRIPTEN_EVENT_TOUCHEND || eventType == EMSCRIPTEN_EVENT_TOUCHCANCEL) {
+        io.AddMouseButtonEvent(ImGuiMouseButton_Left, false);
+    }
+    return EM_TRUE;
 }
 
-@fragment
-fn capsule_fs(input: VertexOutput) -> @location(0) vec4<f32> {
-    let N = normalize(input.normal);
-    let V = normalize(camera.cameraPos.xyz - input.worldPos);
-    let keyDir = normalize(vec3<f32>(-0.45, 0.82, 0.35));
-    let fillDir = normalize(vec3<f32>(0.75, 0.38, -0.55));
-    let topDir = normalize(vec3<f32>(0.10, 1.00, 0.15));
-
-    let key = max(dot(N, keyDir), 0.0);
-    let fill = max(dot(N, fillDir), 0.0);
-    let top = max(dot(N, topDir), 0.0);
-    let sky = clamp(N.y * 0.5 + 0.5, 0.0, 1.0);
-    let rim = pow(1.0 - max(dot(N, V), 0.0), 2.0);
-
-    let ambient = vec3<f32>(0.13, 0.14, 0.17) + (vec3<f32>(0.24, 0.25, 0.28) - vec3<f32>(0.13, 0.14, 0.17)) * sky;
-    let diffuse =
-        ambient +
-        key * vec3<f32>(0.52, 0.50, 0.46) +
-        fill * vec3<f32>(0.13, 0.17, 0.24) +
-        top * vec3<f32>(0.08, 0.08, 0.07);
-
-    let H = normalize(keyDir + V);
-    let spec = pow(max(dot(N, H), 0.0), 64.0) * 0.07;
-    let color = input.color * diffuse + vec3<f32>(spec) + rim * vec3<f32>(0.035, 0.045, 0.060);
-    return vec4<f32>(color, 1.0);
-}
-)WGSL";
-
-static const char* kGridWGSL = R"WGSL(
-struct Camera {
-    viewProj: mat4x4<f32>,
-    cameraPos: vec4<f32>,
-};
-
-@group(0) @binding(0) var<uniform> camera: Camera;
-
-struct VertexOutput {
-    @builtin(position) clipPosition: vec4<f32>,
-};
-
-@vertex
-fn grid_vs(@location(0) position: vec3<f32>) -> VertexOutput {
-    var output: VertexOutput;
-    output.clipPosition = camera.viewProj * vec4<f32>(position, 1.0);
-    return output;
+static EM_BOOL keyCallback(int eventType, const EmscriptenKeyboardEvent* event, void*) {
+    if (std::strcmp(event->key, "r") == 0 || std::strcmp(event->key, "R") == 0) {
+        gResetPressed = eventType == EMSCRIPTEN_EVENT_KEYDOWN;
+    }
+    return EM_FALSE;
 }
 
-@fragment
-fn grid_fs() -> @location(0) vec4<f32> {
-    return vec4<f32>(0.26, 0.28, 0.30, 1.0);
-}
-)WGSL";
-
-static wgpu::ShaderModule createShader(const char* wgslSource) {
-    wgpu::ShaderSourceWGSL source{};
-    source.code = wgslSource;
-    wgpu::ShaderModuleDescriptor desc{};
-    desc.nextInChain = &source;
-    return gDevice.CreateShaderModule(&desc);
-}
-
-static void createCameraResources() {
-    wgpu::BindGroupLayoutEntry entry{};
-    entry.binding = 0;
-    entry.visibility = shaderStage({wgpu::ShaderStage::Vertex, wgpu::ShaderStage::Fragment});
-    entry.buffer.type = wgpu::BufferBindingType::Uniform;
-    entry.buffer.minBindingSize = sizeof(CameraUniform);
-
-    wgpu::BindGroupLayoutDescriptor layoutDesc{};
-    layoutDesc.entryCount = 1;
-    layoutDesc.entries = &entry;
-    gCameraBindGroupLayout = gDevice.CreateBindGroupLayout(&layoutDesc);
-
-    gCameraBuffer = createBuffer(
-        nullptr,
-        sizeof(CameraUniform),
-        bufferUsage({wgpu::BufferUsage::Uniform, wgpu::BufferUsage::CopyDst}));
-
-    wgpu::BindGroupEntry bindEntry{};
-    bindEntry.binding = 0;
-    bindEntry.buffer = gCameraBuffer;
-    bindEntry.offset = 0;
-    bindEntry.size = sizeof(CameraUniform);
-
-    wgpu::BindGroupDescriptor bindDesc{};
-    bindDesc.layout = gCameraBindGroupLayout;
-    bindDesc.entryCount = 1;
-    bindDesc.entries = &bindEntry;
-    gCameraBindGroup = gDevice.CreateBindGroup(&bindDesc);
+static void installCanvasInputCallbacks() {
+    emscripten_set_mousemove_callback(EMSCRIPTEN_EVENT_TARGET_DOCUMENT, nullptr, false, mouseMoveCallback);
+    emscripten_set_mousedown_callback(EMSCRIPTEN_EVENT_TARGET_DOCUMENT, nullptr, false, mouseButtonCallback);
+    emscripten_set_mouseup_callback(EMSCRIPTEN_EVENT_TARGET_DOCUMENT, nullptr, false, mouseButtonCallback);
+    emscripten_set_wheel_callback(EMSCRIPTEN_EVENT_TARGET_DOCUMENT, nullptr, false, wheelCallback);
+    emscripten_set_touchstart_callback(EMSCRIPTEN_EVENT_TARGET_DOCUMENT, nullptr, false, touchCallback);
+    emscripten_set_touchmove_callback(EMSCRIPTEN_EVENT_TARGET_DOCUMENT, nullptr, false, touchCallback);
+    emscripten_set_touchend_callback(EMSCRIPTEN_EVENT_TARGET_DOCUMENT, nullptr, false, touchCallback);
+    emscripten_set_touchcancel_callback(EMSCRIPTEN_EVENT_TARGET_DOCUMENT, nullptr, false, touchCallback);
+    emscripten_set_keydown_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, true, keyCallback);
+    emscripten_set_keyup_callback(EMSCRIPTEN_EVENT_TARGET_WINDOW, nullptr, true, keyCallback);
 }
 
-static wgpu::RenderPipeline createCapsulePipeline() {
-    wgpu::ShaderModule shader = createShader(kCapsuleWGSL);
-
-    std::array<wgpu::VertexAttribute, 5> meshAttrs{};
-    meshAttrs[0] = {nullptr, wgpu::VertexFormat::Float32x3, offsetof(Vertex, position), 0};
-    meshAttrs[1] = {nullptr, wgpu::VertexFormat::Float32x3, offsetof(Vertex, normal), 1};
-    meshAttrs[2] = {nullptr, wgpu::VertexFormat::Float32, offsetof(Vertex, vAlong), 2};
-    meshAttrs[3] = {nullptr, wgpu::VertexFormat::Float32, offsetof(Vertex, region), 3};
-    meshAttrs[4] = {nullptr, wgpu::VertexFormat::Float32, offsetof(Vertex, bodyT), 4};
-
-    std::array<wgpu::VertexAttribute, 5> instanceAttrs{};
-    instanceAttrs[0] = {nullptr, wgpu::VertexFormat::Float32x3, offsetof(Instance, position), 5};
-    instanceAttrs[1] = {nullptr, wgpu::VertexFormat::Float32, offsetof(Instance, height), 6};
-    instanceAttrs[2] = {nullptr, wgpu::VertexFormat::Float32, offsetof(Instance, r1), 7};
-    instanceAttrs[3] = {nullptr, wgpu::VertexFormat::Float32, offsetof(Instance, r2), 8};
-    instanceAttrs[4] = {nullptr, wgpu::VertexFormat::Float32x3, offsetof(Instance, color), 9};
-
-    std::array<wgpu::VertexBufferLayout, 2> layouts{};
-    layouts[0].arrayStride = sizeof(Vertex);
-    layouts[0].stepMode = wgpu::VertexStepMode::Vertex;
-    layouts[0].attributeCount = meshAttrs.size();
-    layouts[0].attributes = meshAttrs.data();
-    layouts[1].arrayStride = sizeof(Instance);
-    layouts[1].stepMode = wgpu::VertexStepMode::Instance;
-    layouts[1].attributeCount = instanceAttrs.size();
-    layouts[1].attributes = instanceAttrs.data();
-
-    wgpu::PipelineLayoutDescriptor pipelineLayoutDesc{};
-    pipelineLayoutDesc.bindGroupLayoutCount = 1;
-    pipelineLayoutDesc.bindGroupLayouts = &gCameraBindGroupLayout;
-    wgpu::PipelineLayout pipelineLayout = gDevice.CreatePipelineLayout(&pipelineLayoutDesc);
-
-    wgpu::ColorTargetState colorTarget{};
-    colorTarget.format = gSurfaceFormat;
-
-    wgpu::FragmentState fragment{};
-    fragment.module = shader;
-    fragment.entryPoint = "capsule_fs";
-    fragment.targetCount = 1;
-    fragment.targets = &colorTarget;
-
-    wgpu::DepthStencilState depth{};
-    depth.format = wgpu::TextureFormat::Depth32Float;
-    depth.depthWriteEnabled = true;
-    depth.depthCompare = wgpu::CompareFunction::Less;
-
-    wgpu::RenderPipelineDescriptor desc{};
-    desc.layout = pipelineLayout;
-    desc.vertex.module = shader;
-    desc.vertex.entryPoint = "capsule_vs";
-    desc.vertex.bufferCount = layouts.size();
-    desc.vertex.buffers = layouts.data();
-    desc.fragment = &fragment;
-    desc.primitive.topology = wgpu::PrimitiveTopology::TriangleList;
-    desc.primitive.frontFace = wgpu::FrontFace::CCW;
-    desc.primitive.cullMode = wgpu::CullMode::Back;
-    desc.multisample.count = kSceneSampleCount;
-    desc.depthStencil = &depth;
-    return gDevice.CreateRenderPipeline(&desc);
+static void vertexAttrib(GLuint index, GLint components, GLsizei stride, size_t offset) {
+    glEnableVertexAttribArray(index);
+    glVertexAttribPointer(index, components, GL_FLOAT, GL_FALSE, stride, reinterpret_cast<void*>(offset));
 }
 
-static wgpu::RenderPipeline createGridPipeline() {
-    wgpu::ShaderModule shader = createShader(kGridWGSL);
+static void createSceneBuffers() {
+    glGenVertexArrays(1, &gCapsuleVao);
+    glGenBuffers(1, &gCapsuleVertexBuffer);
+    glGenBuffers(1, &gCapsuleIndexBuffer);
+    glGenBuffers(1, &gInstanceBuffer);
+    glGenVertexArrays(1, &gGridVao);
+    glGenBuffers(1, &gGridBuffer);
 
-    wgpu::VertexAttribute positionAttr{};
-    positionAttr.format = wgpu::VertexFormat::Float32x3;
-    positionAttr.offset = 0;
-    positionAttr.shaderLocation = 0;
+    glBindVertexArray(gCapsuleVao);
 
-    wgpu::VertexBufferLayout layout{};
-    layout.arrayStride = sizeof(Vec3);
-    layout.stepMode = wgpu::VertexStepMode::Vertex;
-    layout.attributeCount = 1;
-    layout.attributes = &positionAttr;
+    glBindBuffer(GL_ARRAY_BUFFER, gCapsuleVertexBuffer);
+    glBufferData(
+        GL_ARRAY_BUFFER,
+        static_cast<GLsizeiptr>(gVertices.size() * sizeof(Vertex)),
+        gVertices.data(),
+        GL_STATIC_DRAW);
 
-    wgpu::PipelineLayoutDescriptor pipelineLayoutDesc{};
-    pipelineLayoutDesc.bindGroupLayoutCount = 1;
-    pipelineLayoutDesc.bindGroupLayouts = &gCameraBindGroupLayout;
-    wgpu::PipelineLayout pipelineLayout = gDevice.CreatePipelineLayout(&pipelineLayoutDesc);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, gCapsuleIndexBuffer);
+    glBufferData(
+        GL_ELEMENT_ARRAY_BUFFER,
+        static_cast<GLsizeiptr>(gIndices.size() * sizeof(uint32_t)),
+        gIndices.data(),
+        GL_STATIC_DRAW);
 
-    wgpu::ColorTargetState colorTarget{};
-    colorTarget.format = gSurfaceFormat;
+    vertexAttrib(0, 3, sizeof(Vertex), offsetof(Vertex, position));
+    vertexAttrib(1, 3, sizeof(Vertex), offsetof(Vertex, normal));
+    vertexAttrib(2, 1, sizeof(Vertex), offsetof(Vertex, vAlong));
+    vertexAttrib(3, 1, sizeof(Vertex), offsetof(Vertex, region));
+    vertexAttrib(4, 1, sizeof(Vertex), offsetof(Vertex, bodyT));
 
-    wgpu::FragmentState fragment{};
-    fragment.module = shader;
-    fragment.entryPoint = "grid_fs";
-    fragment.targetCount = 1;
-    fragment.targets = &colorTarget;
+    // Per-instance attributes live in one VBO. The divisor is the key detail:
+    // these attributes advance once per capsule, not once per mesh vertex.
+    glBindBuffer(GL_ARRAY_BUFFER, gInstanceBuffer);
+    vertexAttrib(5, 3, sizeof(Instance), offsetof(Instance, position));
+    vertexAttrib(6, 1, sizeof(Instance), offsetof(Instance, height));
+    vertexAttrib(7, 1, sizeof(Instance), offsetof(Instance, r1));
+    vertexAttrib(8, 1, sizeof(Instance), offsetof(Instance, r2));
+    vertexAttrib(9, 3, sizeof(Instance), offsetof(Instance, color));
+    for (GLuint attrib = 5; attrib <= 9; ++attrib) {
+        glVertexAttribDivisor(attrib, 1);
+    }
 
-    wgpu::DepthStencilState depth{};
-    depth.format = wgpu::TextureFormat::Depth32Float;
-    depth.depthWriteEnabled = false;
-    depth.depthCompare = wgpu::CompareFunction::LessEqual;
+    glBindVertexArray(gGridVao);
+    glBindBuffer(GL_ARRAY_BUFFER, gGridBuffer);
+    vertexAttrib(0, 3, sizeof(Vec3), 0);
 
-    wgpu::RenderPipelineDescriptor desc{};
-    desc.layout = pipelineLayout;
-    desc.vertex.module = shader;
-    desc.vertex.entryPoint = "grid_vs";
-    desc.vertex.bufferCount = 1;
-    desc.vertex.buffers = &layout;
-    desc.fragment = &fragment;
-    desc.primitive.topology = wgpu::PrimitiveTopology::LineList;
-    desc.primitive.frontFace = wgpu::FrontFace::CCW;
-    desc.primitive.cullMode = wgpu::CullMode::None;
-    desc.multisample.count = kSceneSampleCount;
-    desc.depthStencil = &depth;
-    return gDevice.CreateRenderPipeline(&desc);
-}
-
-static void configureSurface(uint32_t width, uint32_t height) {
-    gWidth = std::max(width, 1u);
-    gHeight = std::max(height, 1u);
-
-    wgpu::SurfaceConfiguration config{};
-    config.device = gDevice;
-    config.format = gSurfaceFormat;
-    config.usage = wgpu::TextureUsage::RenderAttachment;
-    config.width = gWidth;
-    config.height = gHeight;
-    config.alphaMode = wgpu::CompositeAlphaMode::Auto;
-    config.presentMode = wgpu::PresentMode::Fifo;
-    gSurface.Configure(&config);
-
-    wgpu::TextureDescriptor msaaColorDesc{};
-    msaaColorDesc.usage = wgpu::TextureUsage::RenderAttachment;
-    msaaColorDesc.size = {gWidth, gHeight, 1};
-    msaaColorDesc.format = gSurfaceFormat;
-    msaaColorDesc.sampleCount = kSceneSampleCount;
-    gMsaaColorView = gDevice.CreateTexture(&msaaColorDesc).CreateView();
-
-    wgpu::TextureDescriptor depthDesc{};
-    depthDesc.usage = wgpu::TextureUsage::RenderAttachment;
-    depthDesc.size = {gWidth, gHeight, 1};
-    depthDesc.format = wgpu::TextureFormat::Depth32Float;
-    depthDesc.sampleCount = kSceneSampleCount;
-    gDepthView = gDevice.CreateTexture(&depthDesc).CreateView();
+    glBindVertexArray(0);
+    uploadDynamicSceneBuffers();
 }
 
 static void updateCameraUniform() {
@@ -700,16 +648,9 @@ static void updateCameraUniform() {
 
     const float aspect = static_cast<float>(gWidth) / static_cast<float>(std::max(gHeight, 1u));
     const Mat4 view = lookAt(eye, gCameraTarget, {0.0f, 1.0f, 0.0f});
-    const Mat4 proj = perspectiveWebGPU(radians(45.0f), aspect, 0.05f, 1000.0f);
-    const Mat4 viewProj = multiply(proj, view);
-
-    CameraUniform camera{};
-    std::memcpy(camera.viewProj, viewProj.m, sizeof(viewProj.m));
-    camera.cameraPos[0] = eye.x;
-    camera.cameraPos[1] = eye.y;
-    camera.cameraPos[2] = eye.z;
-    camera.cameraPos[3] = 1.0f;
-    gQueue.WriteBuffer(gCameraBuffer, 0, &camera, sizeof(camera));
+    const Mat4 proj = perspectiveOpenGL(radians(45.0f), aspect, 0.05f, 1000.0f);
+    gViewProj = multiply(proj, view);
+    gCameraPos = eye;
 }
 
 static void resetCamera() {
@@ -739,7 +680,6 @@ static void updateCameraFromImGui() {
             const Vec3 right = normalize(cross(viewDir, {0.0f, 1.0f, 0.0f}));
             const Vec3 up = normalize(cross(right, viewDir));
 
-            // Move the look-at target so the world follows the right-drag motion.
             const float displayHeight = std::max(io.DisplaySize.y, 1.0f);
             const float worldPerPixel = 2.0f * gDistance * std::tan(radians(45.0f) * 0.5f) / displayHeight;
             gCameraTarget += right * (-delta.x * worldPerPixel) + up * (delta.y * worldPerPixel);
@@ -809,7 +749,11 @@ static void drawControls() {
     ImGui::SameLine();
     ImGui::Text("h %.2f", kSphereCenterDistance);
 
-    ImGui::Text("AA: %ux MSAA", kSceneSampleCount);
+    if (gReportedSamples > 1) {
+        ImGui::Text("AA: %dx canvas MSAA", gReportedSamples);
+    } else {
+        ImGui::Text("AA: browser canvas antialias");
+    }
     ImGui::Text("running avg frame: %.2f ms (%.1f fps)", gRunningFrameMs, gRunningFrameMs > 0.0f ? 1000.0f / gRunningFrameMs : 0.0f);
     ImGui::End();
 
@@ -825,24 +769,73 @@ static void drawControls() {
     }
 }
 
+static void renderScene() {
+    glViewport(0, 0, static_cast<GLsizei>(gWidth), static_cast<GLsizei>(gHeight));
+    glEnable(GL_DEPTH_TEST);
+    glDepthFunc(GL_LESS);
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+    glFrontFace(GL_CCW);
+
+    glClearColor(0.08f, 0.085f, 0.095f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+    glUseProgram(gGridProgram);
+    glUniformMatrix4fv(gGridViewProjLocation, 1, GL_FALSE, gViewProj.m);
+    glBindVertexArray(gGridVao);
+    glDrawArrays(GL_LINES, 0, static_cast<GLsizei>(gGridVertexCount));
+
+    glUseProgram(gCapsuleProgram);
+    glUniformMatrix4fv(gCapsuleViewProjLocation, 1, GL_FALSE, gViewProj.m);
+    glUniform3f(gCapsuleCameraPosLocation, gCameraPos.x, gCameraPos.y, gCameraPos.z);
+    glBindVertexArray(gCapsuleVao);
+    glDrawElementsInstanced(
+        GL_TRIANGLES,
+        static_cast<GLsizei>(gIndexCount),
+        GL_UNSIGNED_INT,
+        nullptr,
+        static_cast<GLsizei>(gInstanceCount));
+
+    glBindVertexArray(0);
+}
+
 static void frame() {
-    glfwPollEvents();
+    SDL_Event event;
+    while (SDL_PollEvent(&event)) {
+    }
+
+    double cssWidth = 0.0;
+    double cssHeight = 0.0;
+    if (emscripten_get_element_css_size("#canvas", &cssWidth, &cssHeight) == EMSCRIPTEN_RESULT_SUCCESS) {
+        int windowWidth = 0;
+        int windowHeight = 0;
+        SDL_GetWindowSize(gWindow, &windowWidth, &windowHeight);
+        const int requestedWidth = std::max(1, static_cast<int>(std::round(cssWidth)));
+        const int requestedHeight = std::max(1, static_cast<int>(std::round(cssHeight)));
+        if (windowWidth != requestedWidth || windowHeight != requestedHeight) {
+            SDL_SetWindowSize(gWindow, requestedWidth, requestedHeight);
+        }
+    }
 
     int fbWidth = 0;
     int fbHeight = 0;
-    glfwGetFramebufferSize(gWindow, &fbWidth, &fbHeight);
-    if (fbWidth > 0 && fbHeight > 0 && (static_cast<uint32_t>(fbWidth) != gWidth || static_cast<uint32_t>(fbHeight) != gHeight)) {
-        ImGui_ImplWGPU_InvalidateDeviceObjects();
-        configureSurface(static_cast<uint32_t>(fbWidth), static_cast<uint32_t>(fbHeight));
-        ImGui_ImplWGPU_CreateDeviceObjects();
-    }
+    SDL_GL_GetDrawableSize(gWindow, &fbWidth, &fbHeight);
+    gWidth = static_cast<uint32_t>(std::max(fbWidth, 1));
+    gHeight = static_cast<uint32_t>(std::max(fbHeight, 1));
 
-    if (glfwGetKey(gWindow, GLFW_KEY_R) == GLFW_PRESS) {
+    if (gResetPressed) {
         resetCamera();
     }
 
-    ImGui_ImplWGPU_NewFrame();
-    ImGui_ImplGlfw_NewFrame();
+    ImGui_ImplOpenGL3_NewFrame();
+    ImGuiIO& io = ImGui::GetIO();
+    int windowWidth = 0;
+    int windowHeight = 0;
+    SDL_GetWindowSize(gWindow, &windowWidth, &windowHeight);
+    io.DisplaySize = ImVec2(static_cast<float>(std::max(windowWidth, 1)), static_cast<float>(std::max(windowHeight, 1)));
+    io.DisplayFramebufferScale = ImVec2(
+        static_cast<float>(gWidth) / io.DisplaySize.x,
+        static_cast<float>(gHeight) / io.DisplaySize.y);
     ImGui::NewFrame();
 
     updateCameraFromImGui();
@@ -851,64 +844,9 @@ static void frame() {
     ImGui::Render();
     updateCameraUniform();
 
-    wgpu::SurfaceTexture surfaceTexture{};
-    gSurface.GetCurrentTexture(&surfaceTexture);
-    if (!surfaceTexture.texture) {
-        return;
-    }
-
-    wgpu::TextureView backbuffer = surfaceTexture.texture.CreateView();
-
-    wgpu::RenderPassColorAttachment sceneColorAttachment{};
-    sceneColorAttachment.view = gMsaaColorView;
-    sceneColorAttachment.resolveTarget = backbuffer;
-    sceneColorAttachment.loadOp = wgpu::LoadOp::Clear;
-    sceneColorAttachment.storeOp = wgpu::StoreOp::Discard;
-    sceneColorAttachment.clearValue = {0.08, 0.085, 0.095, 1.0};
-
-    wgpu::RenderPassDepthStencilAttachment depthAttachment{};
-    depthAttachment.view = gDepthView;
-    depthAttachment.depthLoadOp = wgpu::LoadOp::Clear;
-    depthAttachment.depthStoreOp = wgpu::StoreOp::Discard;
-    depthAttachment.depthClearValue = 1.0f;
-
-    wgpu::RenderPassDescriptor scenePassDesc{};
-    scenePassDesc.colorAttachmentCount = 1;
-    scenePassDesc.colorAttachments = &sceneColorAttachment;
-    scenePassDesc.depthStencilAttachment = &depthAttachment;
-
-    wgpu::CommandEncoder encoder = gDevice.CreateCommandEncoder();
-    wgpu::RenderPassEncoder pass = encoder.BeginRenderPass(&scenePassDesc);
-
-    pass.SetPipeline(gGridPipeline);
-    pass.SetBindGroup(0, gCameraBindGroup);
-    pass.SetVertexBuffer(0, gGridBuffer);
-    pass.Draw(gGridVertexCount);
-
-    pass.SetPipeline(gCapsulePipeline);
-    pass.SetBindGroup(0, gCameraBindGroup);
-    pass.SetVertexBuffer(0, gMeshVertexBuffer);
-    pass.SetVertexBuffer(1, gInstanceBuffer);
-    pass.SetIndexBuffer(gMeshIndexBuffer, wgpu::IndexFormat::Uint32);
-    pass.DrawIndexed(gIndexCount, gInstanceCount);
-
-    pass.End();
-
-    wgpu::RenderPassColorAttachment uiColorAttachment{};
-    uiColorAttachment.view = backbuffer;
-    uiColorAttachment.loadOp = wgpu::LoadOp::Load;
-    uiColorAttachment.storeOp = wgpu::StoreOp::Store;
-
-    wgpu::RenderPassDescriptor uiPassDesc{};
-    uiPassDesc.colorAttachmentCount = 1;
-    uiPassDesc.colorAttachments = &uiColorAttachment;
-
-    wgpu::RenderPassEncoder uiPass = encoder.BeginRenderPass(&uiPassDesc);
-    ImGui_ImplWGPU_RenderDrawData(ImGui::GetDrawData(), uiPass.Get());
-    uiPass.End();
-
-    wgpu::CommandBuffer commands = encoder.Finish();
-    gQueue.Submit(1, &commands);
+    renderScene();
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    SDL_GL_SwapWindow(gWindow);
 }
 
 static void setupImGui() {
@@ -930,112 +868,74 @@ static void setupImGui() {
     style.WindowBorderSize = 1.0f;
     style.FramePadding = ImVec2(8.0f, 5.0f);
 
-    ImGui_ImplGlfw_InitForOther(gWindow, true);
-    ImGui_ImplGlfw_InstallEmscriptenCallbacks(gWindow, "#canvas");
-
-    ImGui_ImplWGPU_InitInfo initInfo{};
-    initInfo.Device = gDevice.Get();
-    initInfo.NumFramesInFlight = 3;
-    initInfo.RenderTargetFormat = static_cast<WGPUTextureFormat>(gSurfaceFormat);
-    initInfo.DepthStencilFormat = WGPUTextureFormat_Undefined;
-    ImGui_ImplWGPU_Init(&initInfo);
+    ImGui_ImplOpenGL3_Init("#version 300 es");
+    installCanvasInputCallbacks();
 }
 
 static void initScene() {
-    gQueue = gDevice.GetQueue();
+    setupImGui();
 
-    wgpu::SurfaceCapabilities capabilities{};
-    gSurface.GetCapabilities(gAdapter, &capabilities);
-    if (capabilities.formatCount > 0) {
-        gSurfaceFormat = capabilities.formats[0];
+    glGetIntegerv(GL_SAMPLES, &gReportedSamples);
+
+    gCapsuleProgram = createProgram(kCapsuleVertexShader, kCapsuleFragmentShader, "capsule");
+    gGridProgram = createProgram(kGridVertexShader, kGridFragmentShader, "grid");
+    if (!gCapsuleProgram || !gGridProgram) {
+        std::printf("Failed to create WebGL2 shader programs\n");
+        return;
     }
 
-    int fbWidth = 0;
-    int fbHeight = 0;
-    glfwGetFramebufferSize(gWindow, &fbWidth, &fbHeight);
-    configureSurface(static_cast<uint32_t>(std::max(fbWidth, 1)), static_cast<uint32_t>(std::max(fbHeight, 1)));
-
-    setupImGui();
+    gCapsuleViewProjLocation = glGetUniformLocation(gCapsuleProgram, "uViewProj");
+    gCapsuleCameraPosLocation = glGetUniformLocation(gCapsuleProgram, "uCameraPos");
+    gGridViewProjLocation = glGetUniformLocation(gGridProgram, "uViewProj");
 
     createSharedUnitCapsuleMesh(gVertices, gIndices);
     gIndexCount = static_cast<uint32_t>(gIndices.size());
     rebuildInstances();
     rebuildGridLines();
-
-    gMeshVertexBuffer = createBuffer(
-        gVertices.data(),
-        gVertices.size() * sizeof(Vertex),
-        bufferUsage({wgpu::BufferUsage::Vertex, wgpu::BufferUsage::CopyDst}));
-    gMeshIndexBuffer = createBuffer(
-        gIndices.data(),
-        gIndices.size() * sizeof(uint32_t),
-        bufferUsage({wgpu::BufferUsage::Index, wgpu::BufferUsage::CopyDst}));
-    uploadDynamicSceneBuffers();
-
-    createCameraResources();
-    gCapsulePipeline = createCapsulePipeline();
-    gGridPipeline = createGridPipeline();
+    createSceneBuffers();
 
     resetCamera();
     emscripten_set_main_loop(frame, 0, true);
 }
 
-static void requestDeviceAndStart() {
-    gInstance.RequestAdapter(nullptr, wgpu::CallbackMode::AllowSpontaneous,
-        [](wgpu::RequestAdapterStatus status, wgpu::Adapter adapter, wgpu::StringView message) {
-            if (message.length) {
-                std::printf("RequestAdapter: %.*s\n", static_cast<int>(message.length), message.data);
-            }
-            if (status != wgpu::RequestAdapterStatus::Success) {
-                std::printf("WebGPU adapter request failed\n");
-                return;
-            }
-
-            gAdapter = adapter;
-            wgpu::DeviceDescriptor desc{};
-            desc.SetUncapturedErrorCallback(
-                [](const wgpu::Device&, wgpu::ErrorType type, wgpu::StringView msg) {
-                    std::printf("WebGPU error type=%d: %.*s\n", static_cast<int>(type), static_cast<int>(msg.length), msg.data);
-                });
-
-            gAdapter.RequestDevice(&desc, wgpu::CallbackMode::AllowSpontaneous,
-                [](wgpu::RequestDeviceStatus deviceStatus, wgpu::Device device, wgpu::StringView deviceMessage) {
-                    if (deviceMessage.length) {
-                        std::printf("RequestDevice: %.*s\n", static_cast<int>(deviceMessage.length), deviceMessage.data);
-                    }
-                    if (deviceStatus != wgpu::RequestDeviceStatus::Success) {
-                        std::printf("WebGPU device request failed\n");
-                        return;
-                    }
-
-                    gDevice = device;
-                    initScene();
-                });
-        });
-}
-
 int main() {
-    if (!glfwInit()) {
-        std::printf("Failed to initialize GLFW\n");
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER | SDL_INIT_GAMECONTROLLER) != 0) {
+        std::printf("Failed to initialize SDL: %s\n", SDL_GetError());
         return 1;
     }
 
-    glfwWindowHint(GLFW_CLIENT_API, GLFW_NO_API);
-    gWindow = glfwCreateWindow(static_cast<int>(gWidth), static_cast<int>(gHeight), "WebGPU instanced tapered capsules", nullptr, nullptr);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+
+    gWindow = SDL_CreateWindow(
+        "WebGL2 instanced tapered capsules",
+        SDL_WINDOWPOS_CENTERED,
+        SDL_WINDOWPOS_CENTERED,
+        static_cast<int>(gWidth),
+        static_cast<int>(gHeight),
+        SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
     if (!gWindow) {
-        std::printf("Failed to create GLFW window\n");
-        glfwTerminate();
+        std::printf("Failed to create SDL window: %s\n", SDL_GetError());
         return 1;
     }
 
-    gInstance = wgpu::Instance(wgpuCreateInstance(nullptr));
+    gGlContext = SDL_GL_CreateContext(gWindow);
+    if (!gGlContext) {
+        std::printf("Failed to create WebGL2 context: %s\n", SDL_GetError());
+        return 1;
+    }
 
-    wgpu::EmscriptenSurfaceSourceCanvasHTMLSelector canvasDesc{};
-    canvasDesc.selector = "#canvas";
-    wgpu::SurfaceDescriptor surfaceDesc{};
-    surfaceDesc.nextInChain = &canvasDesc;
-    gSurface = gInstance.CreateSurface(&surfaceDesc);
+    SDL_GL_MakeCurrent(gWindow, gGlContext);
+    SDL_GL_SetSwapInterval(1);
 
-    requestDeviceAndStart();
+    const GLubyte* version = glGetString(GL_VERSION);
+    const GLubyte* renderer = glGetString(GL_RENDERER);
+    std::printf("GL_VERSION: %s\n", version ? reinterpret_cast<const char*>(version) : "unknown");
+    std::printf("GL_RENDERER: %s\n", renderer ? reinterpret_cast<const char*>(renderer) : "unknown");
+
+    initScene();
     return 0;
 }

@@ -1,4 +1,4 @@
-# WebGPU Instanced Tapered Capsules
+# WebGL2 Instanced Tapered Capsules
 
 Live page: [https://janosmeny.com/instanced_capsules/](https://janosmeny.com/instanced_capsules/)
 

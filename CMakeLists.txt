@@ -1,8 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
-project(instanced_tapered_capsules_webgpu LANGUAGES CXX)
+project(instanced_tapered_capsules_webgl2 LANGUAGES CXX)
 
 if (NOT EMSCRIPTEN)
-    message(FATAL_ERROR "This project is WebGPU-only now. Configure it with Emscripten, e.g. `emcmake cmake -S . -B build-web`.")
+    message(FATAL_ERROR "This project targets WebGL2 through Emscripten. Configure it with `emcmake cmake -S . -B build-web`.")
 endif()
 
 set(CMAKE_CXX_STANDARD 17)
@@ -27,8 +27,7 @@ add_library(imgui STATIC
     ${imgui_SOURCE_DIR}/imgui_draw.cpp
     ${imgui_SOURCE_DIR}/imgui_tables.cpp
     ${imgui_SOURCE_DIR}/imgui_widgets.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_glfw.cpp
-    ${imgui_SOURCE_DIR}/backends/imgui_impl_wgpu.cpp
+    ${imgui_SOURCE_DIR}/backends/imgui_impl_opengl3.cpp
 )
 
 target_include_directories(imgui PUBLIC
@@ -37,7 +36,7 @@ target_include_directories(imgui PUBLIC
 )
 
 target_compile_options(imgui PUBLIC
-    --use-port=emdawnwebgpu
+    -sUSE_SDL=2
 )
 
 add_executable(index
@@ -47,12 +46,15 @@ add_executable(index
 target_link_libraries(index PRIVATE imgui)
 
 target_compile_options(index PRIVATE
-    --use-port=emdawnwebgpu
+    -sUSE_SDL=2
 )
 
 target_link_options(index PRIVATE
-    --use-port=emdawnwebgpu
-    -sUSE_GLFW=3
+    -sUSE_SDL=2
+    -sUSE_WEBGL2=1
+    -sMIN_WEBGL_VERSION=2
+    -sMAX_WEBGL_VERSION=2
+    -sFULL_ES3=1
     -sALLOW_MEMORY_GROWTH=1
     -sNO_EXIT_RUNTIME=1
     -sDISABLE_EXCEPTION_CATCHING=1
@@ -68,6 +70,6 @@ set_target_properties(index PROPERTIES
 add_custom_command(TARGET index POST_BUILD
     COMMAND ${CMAKE_COMMAND}
         -DHTML=$<TARGET_FILE:index>
-        -DVERSION=20260506-perf
+        -DVERSION=20260506-webgl2
         -P ${CMAKE_SOURCE_DIR}/web/cache_bust.cmake
 )
